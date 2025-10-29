@@ -1,0 +1,18 @@
+{
+  "name": "forumwire",
+  "version": "1.0.0",
+  "description": "Cross-community Discord bot for TheColi and DapCity activity feeds.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "rss-parser": "^3.12.0",
+    "sqlite3": "^5.1.7"
+  }
+}
