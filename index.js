@@ -3,12 +3,9 @@ import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
-  REST,
-  Routes,
   Events,
   Partials,
 } from "discord.js";
-import sqlite3 from "sqlite3";
 
 // ===== Configuration =====
 const parser = new Parser({ timeout: 20000 });
@@ -21,18 +18,21 @@ if (!FEED_URLS.length) throw new Error("FEED_URLS is required");
 
 const FEED_CHANNEL_MAP = safeJSON(process.env.FEED_CHANNEL_MAP || "{}");
 const BOT_NAME = process.env.BOT_NAME || "ForumWire";
-const DB_FILE = process.env.DB_FILE || "./forumwire.sqlite";
 
 const NEW_CHECK_MS = Number(process.env.NEW_CHECK_MS) || 300000; // 5 minutes
 const ACTIVE_SUMMARY_MS =
   Number(process.env.ACTIVE_SUMMARY_MS) || 21600000; // 6 hours
 const ACTIVE_SUMMARY_HOURS =
-  Number(process.env.ACTIVE_SUMMARY_HOURS) || 24; // activity window
+  Number(process.env.ACTIVE_SUMMARY_HOURS) || 24; // 24-hour window
 const ACTIVE_SUMMARY_LIMIT =
-  Number(process.env.ACTIVE_SUMMARY_LIMIT) || 5; // top threads shown
+  Number(process.env.ACTIVE_SUMMARY_LIMIT) || 5; // top N threads
 
 const COLOR_NEW = 0x0077ff;
 const COLOR_TRENDING = 0xffa500;
+
+// ===== In-Memory Cache =====
+const postedThreads = new Set();
+const observations = [];
 
 // ===== Discord Client =====
 const client = new Client({
@@ -40,29 +40,6 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-// ===== Database Setup =====
-const db = new sqlite3.Database(DB_FILE);
-await initDB();
-
-async function initDB() {
-  await run(
-    `CREATE TABLE IF NOT EXISTS posted (id TEXT PRIMARY KEY, url TEXT, title TEXT, seen INTEGER)`
-  );
-  await run(
-    `CREATE TABLE IF NOT EXISTS observations (id TEXT, url TEXT, title TEXT, seen INTEGER)`
-  );
-}
-
-function run(sql, params = []) {
-  return new Promise((res, rej) =>
-    db.run(sql, params, (e) => (e ? rej(e) : res()))
-  );
-}
-function all(sql, params = []) {
-  return new Promise((res, rej) =>
-    db.all(sql, params, (e, r) => (e ? rej(e) : res(r)))
-  );
-}
 function safeJSON(str) {
   try {
     return JSON.parse(str);
@@ -70,16 +47,18 @@ function safeJSON(str) {
     return {};
   }
 }
+
 function normalize(link) {
   // remove /page-X and trailing slash
   return link.split("/page-")[0].replace(/\/$/, "");
 }
+
 function idFrom(link) {
   const m = link.match(/\.([0-9]+)/);
   return m ? m[1] : link;
 }
 
-// ===== RSS Fetch Logic =====
+// ===== Feed Logic =====
 async function fetchFeed(url) {
   try {
     const feed = await parser.parseURL(url);
@@ -97,23 +76,16 @@ async function processItem(item, feedUrl) {
   const title = item.title || "Untitled Thread";
   const now = Date.now();
 
-  // log activity for trending summary
-  await run(`INSERT INTO observations(id,url,title,seen) VALUES(?,?,?,?)`, [
-    id,
-    link,
-    title,
-    now,
-  ]);
+  // record observation
+  observations.push({ id, link, title, seen: now });
 
-  // dedup new thread posts
-  const exists = await all(`SELECT id FROM posted WHERE id=?`, [id]);
-  if (exists.length) return;
+  // skip already-posted threads
+  if (postedThreads.has(id)) return;
 
   const channelId = FEED_CHANNEL_MAP[feedUrl] || process.env.NEWS_CHANNEL_ID;
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
 
-  // site-specific styling
   const color = feedUrl.includes("dapcity") ? 0xda4453 : COLOR_NEW;
   const source = feedUrl.includes("dapcity") ? "DapCity" : "TheColi";
 
@@ -125,29 +97,33 @@ async function processItem(item, feedUrl) {
     .setTimestamp(new Date());
 
   await channel.send({ embeds: [embed] });
-  await run(`INSERT INTO posted(id,url,title,seen) VALUES(?,?,?,?)`, [
-    id,
-    link,
-    title,
-    now,
-  ]);
+  postedThreads.add(id);
 }
 
 // ===== Trending Summary =====
 async function postTrending() {
   const cutoff = Date.now() - ACTIVE_SUMMARY_HOURS * 3600 * 1000;
-  const rows = await all(
-    `SELECT id,url,title,COUNT(*) as c FROM observations WHERE seen>? GROUP BY id ORDER BY c DESC LIMIT ?`,
-    [cutoff, ACTIVE_SUMMARY_LIMIT]
-  );
-  if (!rows.length) return;
+
+  // count thread appearances within timeframe
+  const counts = {};
+  for (const o of observations) {
+    if (o.seen > cutoff) {
+      counts[o.id] = counts[o.id] || { ...o, c: 0 };
+      counts[o.id].c++;
+    }
+  }
+
+  const sorted = Object.values(counts)
+    .sort((a, b) => b.c - a.c)
+    .slice(0, ACTIVE_SUMMARY_LIMIT);
+  if (!sorted.length) return;
 
   const channelId = process.env.NEWS_CHANNEL_ID;
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel) return;
 
-  const desc = rows
-    .map((r, i) => `**${i + 1}.** [${r.title}](${r.url}) — ${r.c} updates`)
+  const desc = sorted
+    .map((r, i) => `**${i + 1}.** [${r.title}](${r.link}) — ${r.c} updates`)
     .join("\n");
 
   const embed = new EmbedBuilder()
@@ -163,14 +139,12 @@ async function postTrending() {
 // ===== Startup =====
 client.once(Events.ClientReady, () => {
   console.log(`✅ ${BOT_NAME} logged in as ${client.user.tag}`);
-  // schedule feed polling
   FEED_URLS.forEach((u, i) => {
     setTimeout(() => {
       fetchFeed(u);
       setInterval(() => fetchFeed(u), NEW_CHECK_MS);
     }, i * 5000);
   });
-  // schedule trending summary
   setInterval(postTrending, ACTIVE_SUMMARY_MS);
 });
 
