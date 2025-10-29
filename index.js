@@ -3,9 +3,13 @@ import {
   Client,
   GatewayIntentBits,
   EmbedBuilder,
+  REST,
+  Routes,
   Events,
   Partials,
+  SlashCommandBuilder,
 } from "discord.js";
+import fs from "fs";
 
 // ===== Configuration =====
 const parser = new Parser({ timeout: 20000 });
@@ -30,8 +34,27 @@ const ACTIVE_SUMMARY_LIMIT =
 const COLOR_NEW = 0x0077ff;
 const COLOR_TRENDING = 0xffa500;
 
-// ===== In-Memory Cache =====
-const postedThreads = new Set();
+// ===== Persistent Cache (JSON) =====
+const CACHE_FILE = "./postedThreads.json";
+let postedThreads = new Set();
+try {
+  if (fs.existsSync(CACHE_FILE)) {
+    postedThreads = new Set(JSON.parse(fs.readFileSync(CACHE_FILE, "utf8")));
+    console.log(`🗂️ Loaded ${postedThreads.size} cached thread IDs`);
+  }
+} catch (err) {
+  console.error("⚠️ Failed to load cache file:", err);
+}
+
+function saveCache() {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify([...postedThreads]));
+  } catch (err) {
+    console.error("⚠️ Failed to save cache:", err);
+  }
+}
+
+// ===== In-Memory Observations (for trending) =====
 const observations = [];
 
 // ===== Discord Client =====
@@ -98,13 +121,13 @@ async function processItem(item, feedUrl) {
 
   await channel.send({ embeds: [embed] });
   postedThreads.add(id);
+  saveCache(); // persist immediately
 }
 
 // ===== Trending Summary =====
-async function postTrending() {
+async function postTrending(channelOverride = null, ephemeral = false, interaction = null) {
   const cutoff = Date.now() - ACTIVE_SUMMARY_HOURS * 3600 * 1000;
 
-  // count thread appearances within timeframe
   const counts = {};
   for (const o of observations) {
     if (o.seen > cutoff) {
@@ -116,11 +139,14 @@ async function postTrending() {
   const sorted = Object.values(counts)
     .sort((a, b) => b.c - a.c)
     .slice(0, ACTIVE_SUMMARY_LIMIT);
-  if (!sorted.length) return;
-
-  const channelId = process.env.NEWS_CHANNEL_ID;
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-  if (!channel) return;
+  if (!sorted.length) {
+    if (interaction)
+      await interaction.reply({
+        content: "No activity recorded in the last 24h.",
+        ephemeral: true,
+      });
+    return;
+  }
 
   const desc = sorted
     .map((r, i) => `**${i + 1}.** [${r.title}](${r.link}) — ${r.c} updates`)
@@ -133,18 +159,107 @@ async function postTrending() {
     .setFooter({ text: BOT_NAME })
     .setTimestamp(new Date());
 
-  await channel.send({ embeds: [embed] });
+  if (interaction) {
+    await interaction.reply({ embeds: [embed], ephemeral });
+  } else {
+    const channelId = channelOverride || process.env.NEWS_CHANNEL_ID;
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel) return;
+    await channel.send({ embeds: [embed] });
+  }
 }
 
+// ===== Slash Command Registration =====
+async function registerSlashCommands() {
+  const token = process.env.DISCORD_TOKEN;
+  const guildId = process.env.COMMAND_GUILD_ID;
+
+  if (!token || !guildId) {
+    console.warn("⚠️ Missing DISCORD_TOKEN or COMMAND_GUILD_ID — skipping slash registration");
+    return;
+  }
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName("forumwire-top")
+      .setDescription("Show the top active threads right now."),
+    new SlashCommandBuilder()
+      .setName("forumwire-status")
+      .setDescription("Show current ForumWire status."),
+    new SlashCommandBuilder()
+      .setName("forumwire-clearcache")
+      .setDescription("Clear ForumWire’s persistent cache."),
+  ].map((c) => c.toJSON());
+
+  try {
+    const rest = new REST({ version: "10" }).setToken(token);
+    const app = await rest.get(Routes.oauth2CurrentApplication());
+    await rest.put(Routes.applicationGuildCommands(app.id, guildId), {
+      body: commands,
+    });
+    console.log(`✅ Slash commands registered to guild ${guildId}`);
+  } catch (err) {
+    console.error("❌ Failed to register slash commands:", err);
+  }
+}
+
+// ===== Slash Command Handlers =====
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  try {
+    if (interaction.commandName === "forumwire-top") {
+      await postTrending(null, true, interaction);
+    }
+
+    if (interaction.commandName === "forumwire-status") {
+      const info = [
+        `Feeds: ${FEED_URLS.length}`,
+        `Cached Threads: ${postedThreads.size}`,
+        `Observations: ${observations.length}`,
+        `Check interval: ${Math.round(NEW_CHECK_MS / 60000)} min`,
+        `Trending interval: ${Math.round(ACTIVE_SUMMARY_MS / 3600000)} hr`,
+      ].join("\n");
+
+      const embed = new EmbedBuilder()
+        .setTitle("🧭 ForumWire Status")
+        .setDescription(info)
+        .setColor(COLOR_NEW)
+        .setTimestamp(new Date());
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    if (interaction.commandName === "forumwire-clearcache") {
+      postedThreads.clear();
+      observations.length = 0;
+      saveCache();
+      await interaction.reply({
+        content: "✅ ForumWire cache cleared and saved.",
+        ephemeral: true,
+      });
+    }
+  } catch (err) {
+    console.error("Interaction error:", err);
+    if (!interaction.replied)
+      await interaction.reply({
+        content: "⚠️ Error executing command.",
+        ephemeral: true,
+      });
+  }
+});
+
 // ===== Startup =====
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`✅ ${BOT_NAME} logged in as ${client.user.tag}`);
+  await registerSlashCommands();
+
   FEED_URLS.forEach((u, i) => {
     setTimeout(() => {
       fetchFeed(u);
       setInterval(() => fetchFeed(u), NEW_CHECK_MS);
     }, i * 5000);
   });
+
   setInterval(postTrending, ACTIVE_SUMMARY_MS);
 });
 
