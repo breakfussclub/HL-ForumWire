@@ -99,6 +99,14 @@ async function processItem(item, feedUrl) {
   const title = item.title || "Untitled Thread";
   const now = Date.now();
 
+  // Skip old threads (ignore anything older than 6 hours on first run)
+  const maxAgeMs = 6 * 60 * 60 * 1000; // 6 hours
+  const pubDate = item.pubDate ? new Date(item.pubDate).getTime() : null;
+  if (pubDate && now - pubDate > maxAgeMs && !postedThreads.size) {
+    // Only skip on first run (when cache is empty)
+    return;
+  }
+
   // record observation
   observations.push({ id, link, title, seen: now });
 
@@ -120,6 +128,7 @@ async function processItem(item, feedUrl) {
     .setTimestamp(new Date());
 
   await channel.send({ embeds: [embed] });
+  console.log(`[NEW] Posted from ${source}: ${title}`);
   postedThreads.add(id);
   saveCache(); // persist immediately
 }
